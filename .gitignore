@@ -1,0 +1,11 @@
+uploads/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.xlsx
+!dashboard_output.xlsx
+*.json
+crm-dashboard.skill
+~$*
+.DS_Store
