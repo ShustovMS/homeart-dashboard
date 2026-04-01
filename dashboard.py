@@ -255,13 +255,15 @@ def calc_metrics(deals):
         won = sum(1 for d in deal_list if d["rank"] == RANK_WON)
         active = total - lost - won
 
-        # Дошли до предоплаты: rank >= 8 (включая завершённые с rank 90)
-        reached_prepay = sum(1 for d in deal_list if d["rank"] >= CONVERSION_STAGE_PREPAY)
+        # Получена предоплата: поле «Дата предоплаты» заполнено
+        reached_prepay = sum(1 for d in deal_list if d["prepay_date"] is not None)
         # Дошли до оплаты проформы: rank >= 12 (включая завершённые с rank 90)
         reached_proforma = sum(1 for d in deal_list if d["rank"] >= CONVERSION_STAGE_PROFORMA)
 
         total_budget = sum(d["budget"] for d in deal_list)
-        total_prepay = sum(d["prepay_sum"] for d in deal_list)
+        total_prepay = sum(d["prepay_sum"] for d in deal_list if d["prepay_date"] is not None)
+        total_postpay = sum(d["postpay_sum"] for d in deal_list if d["postpay_sum"])
+        total_inflows = total_prepay + total_postpay
         avg_budget = total_budget / total if total else 0
 
         # Бюджет успешных = сделки, прошедшие оплату проформы (rank >= 12)
@@ -295,6 +297,8 @@ def calc_metrics(deals):
             "total_budget": total_budget,
             "success_budget": success_budget,
             "total_prepay": total_prepay,
+            "total_postpay": total_postpay,
+            "total_inflows": total_inflows,
             "avg_budget": avg_budget,
             "avg_cycle_prepay": avg_cycle_prepay,
             "avg_cycle_proforma": avg_cycle_proforma,
@@ -845,19 +849,20 @@ def calc_category_metrics(deals):
     """Считает метрики по категориям товаров."""
     all_categories = [c for c, _ in CATEGORY_MAP] + [CATEGORY_OTHER]
     data = {cat: {"kp": 0, "paid": 0, "lost": 0, "budget_all": 0,
-                  "budget_paid": 0, "prepay_sum": 0} for cat in all_categories}
+                  "budget_paid": 0, "prepay_sum": 0, "postpay_sum": 0} for cat in all_categories}
 
     for d in deals:
         cats = classify_categories(d.get("category_raw", ""))
         # КП = сделки, дошедшие хотя бы до этапа «Подготовка КП» (rank >= 3)
         is_kp = d["rank"] >= 3 or d["rank"] == RANK_WON
-        is_paid = d["rank"] >= CONVERSION_STAGE_PROFORMA  # оплата проформы
+        # Оплачено = заполнено поле «Дата предоплаты» (реальный факт получения денег)
+        is_paid = d["prepay_date"] is not None
         is_lost = d["rank"] == RANK_LOST
 
         for cat in cats:
             if cat not in data:
                 data[cat] = {"kp": 0, "paid": 0, "lost": 0, "budget_all": 0,
-                             "budget_paid": 0, "prepay_sum": 0}
+                             "budget_paid": 0, "prepay_sum": 0, "postpay_sum": 0}
             data[cat]["budget_all"] += d["budget"]
             if is_kp:
                 data[cat]["kp"] += 1
@@ -865,6 +870,7 @@ def calc_category_metrics(deals):
                 data[cat]["paid"] += 1
                 data[cat]["budget_paid"] += d["budget"]
                 data[cat]["prepay_sum"] += d["prepay_sum"]
+                data[cat]["postpay_sum"] += d.get("postpay_sum") or 0
             if is_lost:
                 data[cat]["lost"] += 1
 
@@ -879,7 +885,7 @@ def build_sheet_categories(wb, deals):
 
     ws.cell(row=2, column=1,
             value="КП = сделки, дошедшие до этапа «Подготовка КП» и выше. "
-                  "Оплачено = дошли до «Оплата проформы». "
+                  "Оплачено = заполнено поле «Дата предоплаты» (факт получения денег). "
                   "Одна сделка может входить в несколько категорий."
             ).font = Font(name="Arial", italic=True, size=9, color="4472C4")
 
@@ -889,9 +895,10 @@ def build_sheet_categories(wb, deals):
         "Оплачено\n(кол-во)",
         "Отказов\n(закрыто)",
         "Конверсия\nКП → оплата",
+        "Сумма\nпредоплат, ₽",
+        "Сумма\nпостоплат, ₽",
         "Сумма\nпоступлений, ₽",
         "Средний чек\nоплаченных, ₽",
-        "Сумма\nпредоплат, ₽",
         "Бюджет\nвсех КП, ₽",
     ]
 
@@ -904,7 +911,7 @@ def build_sheet_categories(wb, deals):
     all_categories = [c for c, _ in CATEGORY_MAP] + [CATEGORY_OTHER]
 
     totals = {"kp": 0, "paid": 0, "lost": 0,
-              "budget_all": 0, "budget_paid": 0, "prepay_sum": 0}
+              "budget_all": 0, "budget_paid": 0, "prepay_sum": 0, "postpay_sum": 0}
 
     for i, cat in enumerate(all_categories):
         m = cat_data.get(cat, {})
@@ -914,8 +921,10 @@ def build_sheet_categories(wb, deals):
         budget_all = m.get("budget_all", 0)
         budget_paid = m.get("budget_paid", 0)
         prepay_sum = m.get("prepay_sum", 0)
+        postpay_sum = m.get("postpay_sum", 0)
+        total_inflows = prepay_sum + postpay_sum
         conv = (paid / kp * 100) if kp else 0
-        avg_check = (budget_paid / paid) if paid else 0
+        avg_check = (prepay_sum / paid) if paid else 0  # средний чек = средняя предоплата
 
         row = r + 1 + i
         ws.cell(row=row, column=1, value=cat)
@@ -923,10 +932,11 @@ def build_sheet_categories(wb, deals):
         ws.cell(row=row, column=3, value=paid)
         ws.cell(row=row, column=4, value=lost)
         ws.cell(row=row, column=5, value=fmt_pct(conv))
-        ws.cell(row=row, column=6, value=round(budget_paid))
-        ws.cell(row=row, column=7, value=round(avg_check))
-        ws.cell(row=row, column=8, value=round(prepay_sum))
-        ws.cell(row=row, column=9, value=round(budget_all))
+        ws.cell(row=row, column=6, value=round(prepay_sum))
+        ws.cell(row=row, column=7, value=round(postpay_sum) if postpay_sum else 0)
+        ws.cell(row=row, column=8, value=round(total_inflows))
+        ws.cell(row=row, column=9, value=round(avg_check))
+        ws.cell(row=row, column=10, value=round(budget_all))
         apply_data_style(ws, row, len(headers), is_alt=(i % 2 == 1))
 
         # Подсвечиваем лучшую конверсию
@@ -939,6 +949,7 @@ def build_sheet_categories(wb, deals):
         totals["budget_all"] += budget_all
         totals["budget_paid"] += budget_paid
         totals["prepay_sum"] += prepay_sum
+        totals["postpay_sum"] += postpay_sum
 
     # Итого (не суммируем, т.к. сделки могут входить в несколько категорий)
     note_row = r + len(all_categories) + 2
@@ -962,7 +973,7 @@ def build_sheet_categories(wb, deals):
     for cat in all_categories:
         paid_deals = [
             d for d in deals
-            if d["rank"] >= CONVERSION_STAGE_PROFORMA
+            if d["prepay_date"] is not None
             and cat in classify_categories(d.get("category_raw", ""))
         ]
         paid_deals.sort(key=lambda x: -x["budget"])
@@ -976,7 +987,7 @@ def build_sheet_categories(wb, deals):
             apply_data_style(ws, current_row, len(top_headers), is_alt=(current_row % 2 == 0))
             current_row += 1
 
-    set_col_widths(ws, [22, 12, 12, 12, 16, 20, 18, 18, 18])
+    set_col_widths(ws, [22, 12, 12, 12, 16, 18, 18, 20, 18, 18])
 
 
 # === ГЕНЕРАЦИЯ ===
