@@ -188,9 +188,16 @@ def load_data(filepath):
         sys.exit(1)
 
     deals = []
+    skipped_auto = 0
     for row in rows[1:]:
         def col(idx):
             return row[idx] if idx < len(row) else None
+
+        # Пропускаем технические дубли AmoCRM («Автосделка: ...»)
+        deal_name = str(col(1)).strip() if col(1) else ""
+        if deal_name.lower().startswith("автосделка"):
+            skipped_auto += 1
+            continue
 
         stage_raw = col(6)
         stage_norm = normalize_stage(stage_raw)
@@ -239,6 +246,8 @@ def load_data(filepath):
             "category_raw": raw_category,
         })
 
+    if skipped_auto:
+        print(f"Пропущено автосделок (технические дубли): {skipped_auto}")
     return deals
 
 
