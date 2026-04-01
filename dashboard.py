@@ -334,9 +334,10 @@ def calc_metrics(deals, period_start=None, period_end=None):
         }
 
     dept = metrics_for(deals)
-    managers = {}
-    for mgr, mgr_deals in sorted(by_manager.items(), key=lambda x: -len(x[1])):
-        managers[mgr] = metrics_for(mgr_deals)
+
+    # Сначала считаем метрики для каждого менеджера, потом сортируем по кол-ву сделок В ПЕРИОДЕ
+    raw_managers = {mgr: metrics_for(mgr_deals) for mgr, mgr_deals in by_manager.items()}
+    managers = dict(sorted(raw_managers.items(), key=lambda x: -x[1]["total"]))
 
     return dept, managers
 
