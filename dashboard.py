@@ -924,7 +924,7 @@ def build_sheet_categories(wb, deals):
         postpay_sum = m.get("postpay_sum", 0)
         total_inflows = prepay_sum + postpay_sum
         conv = (paid / kp * 100) if kp else 0
-        avg_check = (prepay_sum / paid) if paid else 0  # средний чек = средняя предоплата
+        avg_check = (budget_paid / paid) if paid else 0
 
         row = r + 1 + i
         ws.cell(row=row, column=1, value=cat)
