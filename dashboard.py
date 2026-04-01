@@ -290,6 +290,17 @@ def calc_metrics(deals, period_start=None, period_end=None):
         reached_prepay = len(paid_in_period)
         reached_proforma = sum(1 for d in funnel if d["rank"] >= CONVERSION_STAGE_PROFORMA)
 
+        # Скорректированный знаменатель для конверсии:
+        # новые лиды в периоде + сделки из прошлых периодов, оплаченные в этом периоде
+        if has_period:
+            legacy_paid = [d for d in paid_in_period
+                           if d["created"] and not _in_period(d["created"], period_start, period_end)]
+            conv_denominator = total + len(legacy_paid)
+            legacy_paid_count = len(legacy_paid)
+        else:
+            conv_denominator = total
+            legacy_paid_count = 0
+
         total_budget = sum(d["budget"] for d in funnel)
         total_prepay = sum(d["prepay_sum"] for d in paid_in_period)
         total_postpay = sum(d["postpay_sum"] for d in paid_in_period if d["postpay_sum"])
@@ -319,7 +330,9 @@ def calc_metrics(deals, period_start=None, period_end=None):
             "active": active,
             "reached_prepay": reached_prepay,
             "reached_proforma": reached_proforma,
-            "conv_prepay": (reached_prepay / total * 100) if total else 0,
+            "legacy_paid_count": legacy_paid_count,
+            "conv_denominator": conv_denominator,
+            "conv_prepay": (reached_prepay / conv_denominator * 100) if conv_denominator else 0,
             "conv_proforma": (reached_proforma / total * 100) if total else 0,
             "total_budget": total_budget,
             "success_budget": success_budget,
@@ -540,6 +553,22 @@ def build_sheet_conversion(wb, dept, managers, period_start=None, period_end=Non
         cell.border = THIN_BORDER
         cell.fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
 
+    # Пояснение к формуле конверсии при заданном периоде
+    if (period_start or period_end) and dept.get("legacy_paid_count", 0) > 0:
+        note_row = tr + 2
+        legacy = dept["legacy_paid_count"]
+        denom = dept["conv_denominator"]
+        note = (
+            f"* Конверсия в предоплату считается по скорректированному знаменателю: "
+            f"новые лиды в периоде ({dept['total']}) + сделки из прошлых периодов, "
+            f"оплаченные в этом периоде ({legacy}) = {denom}. "
+            f"Это даёт корректное сравнение: все «закрытые» в периоде предоплаты "
+            f"делятся на все «активные» для этого периода сделки."
+        )
+        ws.cell(row=note_row, column=1, value=note).font = Font(
+            name="Arial", italic=True, size=9, color="996633")
+        ws.merge_cells(f"A{note_row}:O{note_row}")
+
     set_col_widths(ws, [36, 10, 12, 12, 12, 14, 14, 14, 14, 18, 18, 18, 16, 16, 16])
 
 
@@ -682,6 +711,15 @@ def build_sheet_methodology(wb):
             "Пример: сделка создана в ноябре 2025, предоплата получена в марте 2026 → "
             "попадёт в поступления Q1 2026, даже если дата создания вне периода. "
             "Решает проблему «длинных» сделок, которые начались до квартала"
+        ),
+        (
+            "Конверсия в предоплату — скорректированный знаменатель",
+            "Предоплат получено в периоде / (Новых лидов в периоде + Сделок из прошлых периодов, оплаченных в этом периоде)",
+            "Колонки [9] Дата создания, [34] Дата предоплаты",
+            "Пример: 10 новых лидов в Q1, получено 5 предоплат (4 из Q1, 1 из прошлого периода). "
+            "Конверсия = 5 / (10 + 1) = 45.5%. "
+            "Это корректнее чем 5/10, т.к. «чужая» сделка добавляется в знаменатель. "
+            "Чем длиннее период анализа — тем ближе цифра к реальной конверсии когорты"
         ),
         # --- Основные счётчики ---
         (
