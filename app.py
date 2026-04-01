@@ -150,6 +150,36 @@ HTML = """
   .stat { background: #f8fafc; border-radius: 8px; padding: 12px 14px; }
   .stat-val { font-size: 20px; font-weight: 700; color: #1a1a2e; }
   .stat-lbl { font-size: 12px; color: #9ca3af; margin-top: 2px; }
+
+  .period-block {
+    margin-top: 20px;
+    background: #f8fafc;
+    border-radius: 12px;
+    padding: 16px 18px;
+    border: 1px solid #e5e7eb;
+  }
+  .period-label {
+    font-size: 13px; font-weight: 600; color: #374151;
+    margin-bottom: 4px;
+  }
+  .period-hint {
+    font-size: 12px; color: #9ca3af; margin-bottom: 12px;
+  }
+  .period-row { display: flex; gap: 12px; align-items: center; }
+  .period-row label { font-size: 13px; color: #6b7280; white-space: nowrap; }
+  .period-row input[type=date] {
+    flex: 1;
+    padding: 8px 10px;
+    border: 1px solid #d1d5db;
+    border-radius: 8px;
+    font-size: 14px;
+    color: #1a1a2e;
+    background: #fff;
+  }
+  .period-row input[type=date]:focus {
+    outline: none; border-color: #2F5496;
+  }
+  .period-sep { font-size: 13px; color: #9ca3af; }
 </style>
 </head>
 <body>
@@ -166,6 +196,20 @@ HTML = """
       <div class="drop-label">Нажми или перетащи файл сюда</div>
       <div class="drop-hint">.xlsx · до 50 МБ</div>
       <div class="file-name" id="fileName"></div>
+    </div>
+    <div class="period-block">
+      <div class="period-label">Период анализа <span style="font-weight:400;color:#9ca3af">(необязательно)</span></div>
+      <div class="period-hint">
+        Если выгрузка за широкий период — укажи нужный квартал.<br>
+        Воронка считается по дате <b>создания</b> сделки, поступления — по дате <b>предоплаты</b>.
+      </div>
+      <div class="period-row">
+        <label>с</label>
+        <input type="date" id="periodFrom" name="period_from">
+        <span class="period-sep">—</span>
+        <label>по</label>
+        <input type="date" id="periodTo" name="period_to">
+      </div>
     </div>
     <button class="btn" id="btn" type="submit" disabled>Сгенерировать дашборд</button>
   </form>
@@ -265,6 +309,10 @@ document.getElementById('form').addEventListener('submit', async (e) => {
 
   const fd = new FormData();
   fd.append('file', file);
+  const pFrom = document.getElementById('periodFrom').value;
+  const pTo   = document.getElementById('periodTo').value;
+  if (pFrom) fd.append('period_from', pFrom);
+  if (pTo)   fd.append('period_to',   pTo);
 
   try {
     const resp = await fetch('/generate', { method: 'POST', body: fd });
@@ -318,6 +366,7 @@ def index():
 
 @app.route("/generate", methods=["POST"])
 def generate():
+    from datetime import datetime as dt
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify(ok=False, error="Файл не выбран")
@@ -328,17 +377,27 @@ def generate():
 
     f.save(str(input_path))
 
+    # Период анализа (необязательный)
+    def parse_date(s):
+        try:
+            return dt.strptime(s, "%Y-%m-%d") if s else None
+        except Exception:
+            return None
+
+    period_start = parse_date(request.form.get("period_from", ""))
+    period_end   = parse_date(request.form.get("period_to", ""))
+
     try:
         deals = db.load_data(str(input_path))
-        dept, managers = db.calc_metrics(deals)
+        dept, managers = db.calc_metrics(deals, period_start, period_end)
 
         wb = __import__("openpyxl").Workbook()
         wb.remove(wb.active)
-        db.build_sheet_summary(wb, dept, managers, deals)
-        db.build_sheet_conversion(wb, dept, managers)
-        db.build_sheet_funnel(wb, managers)
-        db.build_sheet_categories(wb, deals)
-        db.build_sheet_deals(wb, deals)
+        db.build_sheet_summary(wb, dept, managers, deals, period_start, period_end)
+        db.build_sheet_conversion(wb, dept, managers, period_start, period_end)
+        db.build_sheet_funnel(wb, managers, period_start, period_end)
+        db.build_sheet_categories(wb, deals, period_start, period_end)
+        db.build_sheet_deals(wb, deals, period_start, period_end)
         db.build_sheet_methodology(wb)
         wb.save(str(output_path))
 

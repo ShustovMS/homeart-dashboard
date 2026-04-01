@@ -244,45 +244,63 @@ def load_data(filepath):
 
 # === РАСЧЁТ МЕТРИК ===
 
-def calc_metrics(deals):
+def _in_period(date, period_start, period_end):
+    """Проверяет, попадает ли дата в указанный период."""
+    if date is None:
+        return False
+    if period_start and date < period_start:
+        return False
+    if period_end and date > period_end:
+        return False
+    return True
+
+
+def calc_metrics(deals, period_start=None, period_end=None):
     by_manager = defaultdict(list)
     for d in deals:
         by_manager[d["manager"]].append(d)
 
+    has_period = bool(period_start or period_end)
+
     def metrics_for(deal_list):
-        total = len(deal_list)
-        lost = sum(1 for d in deal_list if d["rank"] == RANK_LOST)
-        won = sum(1 for d in deal_list if d["rank"] == RANK_WON)
+        # Воронка/конверсия: сделки, созданные в периоде (или все, если период не задан)
+        funnel = [d for d in deal_list
+                  if not has_period or _in_period(d["created"], period_start, period_end)]
+
+        # Поступления: сделки, у которых предоплата получена в периоде
+        paid_in_period = [d for d in deal_list
+                          if _in_period(d["prepay_date"], period_start, period_end)] \
+                         if has_period else \
+                         [d for d in deal_list if d["prepay_date"] is not None]
+
+        total = len(funnel)
+        lost = sum(1 for d in funnel if d["rank"] == RANK_LOST)
+        won = sum(1 for d in funnel if d["rank"] == RANK_WON)
         active = total - lost - won
 
-        # Получена предоплата: поле «Дата предоплаты» заполнено
-        reached_prepay = sum(1 for d in deal_list if d["prepay_date"] is not None)
-        # Дошли до оплаты проформы: rank >= 12 (включая завершённые с rank 90)
-        reached_proforma = sum(1 for d in deal_list if d["rank"] >= CONVERSION_STAGE_PROFORMA)
+        reached_prepay = len(paid_in_period)
+        reached_proforma = sum(1 for d in funnel if d["rank"] >= CONVERSION_STAGE_PROFORMA)
 
-        total_budget = sum(d["budget"] for d in deal_list)
-        total_prepay = sum(d["prepay_sum"] for d in deal_list if d["prepay_date"] is not None)
-        total_postpay = sum(d["postpay_sum"] for d in deal_list if d["postpay_sum"])
+        total_budget = sum(d["budget"] for d in funnel)
+        total_prepay = sum(d["prepay_sum"] for d in paid_in_period)
+        total_postpay = sum(d["postpay_sum"] for d in paid_in_period if d["postpay_sum"])
         total_inflows = total_prepay + total_postpay
         avg_budget = total_budget / total if total else 0
 
-        # Бюджет успешных = сделки, прошедшие оплату проформы (rank >= 12)
-        success_budget = sum(d["budget"] for d in deal_list if d["rank"] >= CONVERSION_STAGE_PROFORMA)
+        success_budget = sum(d["budget"] for d in funnel if d["rank"] >= CONVERSION_STAGE_PROFORMA)
 
-        # Средний цикл до предоплаты
-        cycles_prepay = [d["cycle_prepay"] for d in deal_list if d["cycle_prepay"] is not None]
+        cycles_prepay = [d["cycle_prepay"] for d in paid_in_period if d["cycle_prepay"] is not None]
         avg_cycle_prepay = sum(cycles_prepay) / len(cycles_prepay) if cycles_prepay else None
 
-        # Средний цикл до оплаты проформы
-        cycles_proforma = [d["cycle_proforma"] for d in deal_list if d["cycle_proforma"] is not None]
+        cycles_proforma = [d["cycle_proforma"] for d in funnel if d["cycle_proforma"] is not None]
         avg_cycle_proforma = sum(cycles_proforma) / len(cycles_proforma) if cycles_proforma else None
 
         stage_counts = defaultdict(int)
-        for d in deal_list:
+        for d in funnel:
             stage_counts[d["stage"]] += 1
 
         stage_budgets = defaultdict(float)
-        for d in deal_list:
+        for d in funnel:
             stage_budgets[d["stage"]] += d["budget"]
 
         return {
@@ -354,16 +372,18 @@ def fmt_cycle(val):
 
 # === ЛИСТ 1: СВОД ПО ОТДЕЛУ ===
 
-def build_sheet_summary(wb, dept, managers, deals):
+def build_sheet_summary(wb, dept, managers, deals, period_start=None, period_end=None):
     ws = wb.create_sheet("Свод по отделу")
-
-    ws.cell(row=1, column=1, value="Сводная аналитика отдела проектов HOMEART").font = TITLE_FONT
+    period_str = fmt_period(period_start, period_end)
+    title = f"Сводная аналитика отдела проектов HOMEART" + (f"  ·  {period_str}" if period_str else "")
+    ws.cell(row=1, column=1, value=title).font = TITLE_FONT
     ws.merge_cells("A1:E1")
 
-    ws.cell(row=2, column=1,
-            value="Конверсия рассчитана по всем сделкам, включая закрытые и успешные. "
-                  "Подробности расчётов — на листе «Методология»."
-            ).font = Font(name="Arial", italic=True, size=9, color="4472C4")
+    hint = "Конверсия рассчитана по всем сделкам, включая закрытые и успешные. " \
+           "Подробности расчётов — на листе «Методология»."
+    if period_str:
+        hint = f"Период анализа: {period_str}. Воронка — по дате создания сделки, поступления — по дате предоплаты. " + hint
+    ws.cell(row=2, column=1, value=hint).font = Font(name="Arial", italic=True, size=9, color="4472C4")
 
     r = 3
     ws.cell(row=r, column=1, value="Показатель").font = SUBTITLE_FONT
@@ -431,14 +451,18 @@ def build_sheet_summary(wb, dept, managers, deals):
 
 # === ЛИСТ 2: КОНВЕРСИЯ ПО МЕНЕДЖЕРАМ ===
 
-def build_sheet_conversion(wb, dept, managers):
+def build_sheet_conversion(wb, dept, managers, period_start=None, period_end=None):
     ws = wb.create_sheet("Конверсия по менеджерам")
-
-    ws.cell(row=1, column=1, value="Конверсия по менеджерам").font = TITLE_FONT
+    period_str = fmt_period(period_start, period_end)
+    title = "Конверсия по менеджерам" + (f"  ·  {period_str}" if period_str else "")
+    ws.cell(row=1, column=1, value=title).font = TITLE_FONT
     ws.merge_cells("A1:O1")
 
+    hint = "Подробности расчётов каждого показателя — на листе «Методология»."
+    if period_str:
+        hint = f"Период: {period_str}. Воронка по дате создания, поступления по дате предоплаты. " + hint
     ws.cell(row=2, column=1,
-            value="Подробности расчётов каждого показателя — на листе «Методология»."
+            value=hint
             ).font = Font(name="Arial", italic=True, size=9, color="4472C4")
 
     headers = [
@@ -511,10 +535,11 @@ def build_sheet_conversion(wb, dept, managers):
 
 # === ЛИСТ 3: ВОРОНКА ПО МЕНЕДЖЕРАМ ===
 
-def build_sheet_funnel(wb, managers):
+def build_sheet_funnel(wb, managers, period_start=None, period_end=None):
     ws = wb.create_sheet("Воронка по менеджерам")
-
-    ws.cell(row=1, column=1, value="Распределение сделок по этапам и менеджерам").font = TITLE_FONT
+    period_str = fmt_period(period_start, period_end)
+    title = "Распределение сделок по этапам и менеджерам" + (f"  ·  {period_str}" if period_str else "")
+    ws.cell(row=1, column=1, value=title).font = TITLE_FONT
     ws.merge_cells(f"A1:{get_column_letter(len(SALES_FUNNEL_STAGES) + 1)}1")
 
     r = 3
@@ -541,10 +566,11 @@ def build_sheet_funnel(wb, managers):
 
 # === ЛИСТ 4: ВСЕ СДЕЛКИ ===
 
-def build_sheet_deals(wb, deals):
+def build_sheet_deals(wb, deals, period_start=None, period_end=None):
     ws = wb.create_sheet("Все сделки")
-
-    ws.cell(row=1, column=1, value="Все сделки — детализация").font = TITLE_FONT
+    period_str = fmt_period(period_start, period_end)
+    title = "Все сделки — детализация" + (f"  ·  {period_str}" if period_str else "")
+    ws.cell(row=1, column=1, value=title).font = TITLE_FONT
     ws.merge_cells("A1:L1")
 
     headers = [
@@ -625,11 +651,33 @@ def build_sheet_methodology(wb):
     apply_header_style(ws, r, len(headers))
 
     rows_data = [
+        # --- Период анализа ---
+        (
+            "Период анализа (необязательный)",
+            "Задаётся при загрузке файла в интерфейсе. Если не задан — анализируются все сделки из выгрузки",
+            "Поля «с» и «по» в форме загрузки",
+            "Рекомендуется: загружать широкую выгрузку (12–18 мес.), указывать нужный квартал как период. "
+            "Это позволяет учесть сделки, начатые до квартала, но оплаченные в нём"
+        ),
+        (
+            "Воронка и конверсия (при заданном периоде)",
+            "Учитываются сделки, у которых дата СОЗДАНИЯ попадает в период",
+            "Колонка [9] Дата создания",
+            "Показывает: сколько новых лидов пришло в периоде и как они конвертируются"
+        ),
+        (
+            "Поступления и оплаченные сделки (при заданном периоде)",
+            "Учитываются сделки, у которых дата ПРЕДОПЛАТЫ попадает в период — независимо от даты создания",
+            "Колонка [34] Дата предоплаты",
+            "Пример: сделка создана в ноябре 2025, предоплата получена в марте 2026 → "
+            "попадёт в поступления Q1 2026, даже если дата создания вне периода. "
+            "Решает проблему «длинных» сделок, которые начались до квартала"
+        ),
         # --- Основные счётчики ---
         (
             "Всего сделок",
-            "Количество всех строк в выгрузке (каждая строка = одна сделка)",
-            "Кол-во строк в файле AmoCRM",
+            "Количество сделок, созданных в периоде (или всех, если период не задан)",
+            "Кол-во строк в файле AmoCRM, фильтр по дате создания",
             "Включает активные, завершённые и не реализованные"
         ),
         (
@@ -1045,25 +1093,41 @@ def classify_categories(raw_category):
     return list(result) if result else [CATEGORY_OTHER]
 
 
-def calc_category_metrics(deals):
+def fmt_period(period_start, period_end):
+    """Возвращает строку с периодом для заголовков."""
+    if not period_start and not period_end:
+        return ""
+    parts = []
+    if period_start:
+        parts.append(period_start.strftime("%d.%m.%Y"))
+    if period_end:
+        parts.append(period_end.strftime("%d.%m.%Y"))
+    return " — ".join(parts)
+
+
+def calc_category_metrics(deals, period_start=None, period_end=None):
     """Считает метрики по категориям товаров."""
+    has_period = bool(period_start or period_end)
     all_categories = [c for c, _ in CATEGORY_MAP] + [CATEGORY_OTHER]
     data = {cat: {"kp": 0, "paid": 0, "lost": 0, "budget_all": 0,
                   "budget_paid": 0, "prepay_sum": 0, "postpay_sum": 0} for cat in all_categories}
 
     for d in deals:
         cats = classify_categories(d.get("category_raw", ""))
-        # КП = сделки, дошедшие хотя бы до этапа «Подготовка КП» (rank >= 3)
-        is_kp = d["rank"] >= 3 or d["rank"] == RANK_WON
-        # Оплачено = заполнено поле «Дата предоплаты» (реальный факт получения денег)
-        is_paid = d["prepay_date"] is not None
-        is_lost = d["rank"] == RANK_LOST
+        # КП = сделки, созданные в периоде и дошедшие до этапа «Подготовка КП» (rank >= 3)
+        in_funnel = not has_period or _in_period(d["created"], period_start, period_end)
+        is_kp = in_funnel and (d["rank"] >= 3 or d["rank"] == RANK_WON)
+        is_lost = in_funnel and d["rank"] == RANK_LOST
+        # Оплачено = предоплата получена в периоде
+        is_paid = _in_period(d["prepay_date"], period_start, period_end) \
+                  if has_period else d["prepay_date"] is not None
 
         for cat in cats:
             if cat not in data:
                 data[cat] = {"kp": 0, "paid": 0, "lost": 0, "budget_all": 0,
                              "budget_paid": 0, "prepay_sum": 0, "postpay_sum": 0}
-            data[cat]["budget_all"] += d["budget"]
+            if in_funnel:
+                data[cat]["budget_all"] += d["budget"]
             if is_kp:
                 data[cat]["kp"] += 1
             if is_paid:
@@ -1077,17 +1141,20 @@ def calc_category_metrics(deals):
     return data
 
 
-def build_sheet_categories(wb, deals):
+def build_sheet_categories(wb, deals, period_start=None, period_end=None):
     ws = wb.create_sheet("По категориям")
-
-    ws.cell(row=1, column=1, value="Аналитика по категориям товаров").font = TITLE_FONT
+    period_str = fmt_period(period_start, period_end)
+    title = "Аналитика по категориям товаров" + (f"  ·  {period_str}" if period_str else "")
+    ws.cell(row=1, column=1, value=title).font = TITLE_FONT
     ws.merge_cells("A1:I1")
 
-    ws.cell(row=2, column=1,
-            value="КП = сделки, дошедшие до этапа «Подготовка КП» и выше. "
-                  "Оплачено = заполнено поле «Дата предоплаты» (факт получения денег). "
-                  "Одна сделка может входить в несколько категорий."
-            ).font = Font(name="Arial", italic=True, size=9, color="4472C4")
+    hint = "КП = сделки, созданные в периоде и дошедшие до этапа «Подготовка КП». " \
+           "Оплачено = предоплата получена в периоде. Одна сделка может входить в несколько категорий."
+    if not period_str:
+        hint = "КП = сделки, дошедшие до этапа «Подготовка КП» и выше. " \
+               "Оплачено = заполнено поле «Дата предоплаты» (факт получения денег). " \
+               "Одна сделка может входить в несколько категорий."
+    ws.cell(row=2, column=1, value=hint).font = Font(name="Arial", italic=True, size=9, color="4472C4")
 
     headers = [
         "Категория",
@@ -1107,7 +1174,7 @@ def build_sheet_categories(wb, deals):
         ws.cell(row=r, column=c, value=h)
     apply_header_style(ws, r, len(headers))
 
-    cat_data = calc_category_metrics(deals)
+    cat_data = calc_category_metrics(deals, period_start, period_end)
     all_categories = [c for c, _ in CATEGORY_MAP] + [CATEGORY_OTHER]
 
     totals = {"kp": 0, "paid": 0, "lost": 0,
@@ -1173,7 +1240,8 @@ def build_sheet_categories(wb, deals):
     for cat in all_categories:
         paid_deals = [
             d for d in deals
-            if d["prepay_date"] is not None
+            if (_in_period(d["prepay_date"], period_start, period_end)
+                if (period_start or period_end) else d["prepay_date"] is not None)
             and cat in classify_categories(d.get("category_raw", ""))
         ]
         paid_deals.sort(key=lambda x: -x["budget"])
